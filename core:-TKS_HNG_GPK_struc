@@ -1,0 +1,324 @@
+`timescale 1ns / 1ps
+
+
+(* DONT_TOUCH = "true" *)
+module mux_stage (
+    input  logic in_t,
+    input  logic in_b,
+    input  logic sel,
+    output logic out_t,
+    output logic out_b
+);
+    assign out_t = sel ? in_b : in_t;
+    assign out_b = sel ? in_t : in_b;
+endmodule
+ 
+ 
+(* DONT_TOUCH = "true" *)
+module tks_stage (
+    input  logic top_in,
+    input  logic bottom_in,
+    input  logic sel,
+    output logic top_out,
+    output logic bottom_out,
+    output logic q_out
+);
+    assign top_out    = (top_in & ~sel) | (bottom_in & sel);
+    assign q_out      =  top_in ^ bottom_in ^ sel;
+    assign bottom_out = (top_in & sel)  | (bottom_in & ~sel);
+endmodule
+ 
+ 
+(* KEEP_HIERARCHY = "yes" *)
+module apuf_32_base (
+    input  logic        excite,
+    input  logic [31:0] challenge,
+    output logic        response
+);
+    logic [32:0] top_path;
+    logic [32:0] bottom_path;
+ 
+    assign top_path[0]    = excite;
+    assign bottom_path[0] = excite;
+ 
+    genvar i;
+    generate
+        for (i = 0; i < 32; i++) begin : STAGE
+            (* DONT_TOUCH = "true" *)
+            mux_stage M (
+                .in_t  (top_path[i]),
+                .in_b  (bottom_path[i]),
+                .sel   (challenge[i]),
+                .out_t (top_path[i+1]),
+                .out_b (bottom_path[i+1])
+            );
+        end
+    endgenerate
+ 
+    // Arbiter DFF
+    (* DONT_TOUCH = "true" *) logic arb_q = 1'b0;
+    always_ff @(posedge bottom_path[32])
+        arb_q <= top_path[32];
+    assign response = arb_q;
+endmodule
+ 
+ 
+(* KEEP_HIERARCHY = "yes" *)
+module apuf_32_tks (
+    input  logic        excite,
+    input  logic [31:0] challenge,
+    output logic        response,
+    output logic        tks_q
+);
+    logic [32:0] top_path;
+    logic [32:0] bottom_path;
+ 
+    assign top_path[0]    = excite;
+    assign bottom_path[0] = excite;
+ 
+    genvar i;
+    generate
+        for (i = 0; i < 32; i++) begin : STAGE
+            if (i == 16) begin : TKS_STAGE
+                (* DONT_TOUCH = "true" *)
+                tks_stage TKS (
+                    .top_in     (top_path[i]),
+                    .bottom_in  (bottom_path[i]),
+                    .sel        (challenge[i]),
+                    .top_out    (top_path[i+1]),
+                    .bottom_out (bottom_path[i+1]),
+                    .q_out      (tks_q)
+                );
+            end
+            else begin : NORMAL_STAGE
+                (* DONT_TOUCH = "true" *)
+                mux_stage M (
+                    .in_t  (top_path[i]),
+                    .in_b  (bottom_path[i]),
+                    .sel   (challenge[i]),
+                    .out_t (top_path[i+1]),
+                    .out_b (bottom_path[i+1])
+                );
+            end
+        end
+    endgenerate
+ 
+    // Arbiter DFF
+    (* DONT_TOUCH = "true" *) logic arb_q = 1'b0;
+    always_ff @(posedge bottom_path[32])
+        arb_q <= top_path[32];
+    assign response = arb_q;
+endmodule
+ 
+module lfsr_32 (
+    input  logic        clk,
+    input  logic        rst,
+    input  logic        en,
+    output logic [31:0] challenge
+);
+    always_ff @(posedge clk or posedge rst) begin
+        if (rst)
+            challenge <= 32'hACE1_1234;
+        else if (en)
+            challenge <= {
+                challenge[30:0],
+                challenge[31] ^ challenge[21] ^ challenge[1] ^ challenge[0]
+            };
+    end
+endmodule
+ 
+// Latches the TKS feedback bit once per controlled round (only when en=1).
+module q_feedback_reg (
+    input  logic clk,
+    input  logic rst,
+    input  logic en,
+    input  logic q_in,
+    output logic q_reg
+);
+  
+    always_ff @(posedge clk or posedge rst)begin
+        if(rst)
+          q_reg<=1'b0;
+        else if (en)
+          q_reg<=q_in;
+    end
+    
+endmodule
+ 
+ 
+module hng_gate (
+    input  logic A,
+    input  logic B,
+    input  logic C,
+    input  logic D,
+    output logic P,
+    output logic Q,
+    output logic R,
+    output logic S
+);
+    assign P = A;
+    assign Q = B;
+    assign R = A ^ B ^ C;
+    assign S = ((A ^ B) & C) ^ (A & B) ^ D;
+endmodule
+ 
+ 
+module gpk_gate (
+    input  logic L,
+    input  logic M,
+    input  logic N,
+    input  logic O,
+    output logic O1,
+    output logic O2,
+    output logic O3,
+    output logic O4
+);
+    assign O1 = L;
+    assign O2 = L ^ M;
+    assign O3 = (L & M) ^ N;
+    assign O4 = N ^ O;
+endmodule
+ 
+ 
+
+module hng_gpk_aggregation (
+    input  logic [3:0] R_raw,
+    output logic [3:0] K
+);
+    logic hng_p;
+    logic hng_q;
+    logic hng_r;
+    logic hng_s;
+ 
+    hng_gate HNG (
+        .A (R_raw[0]),
+        .B (R_raw[1]),
+        .C (R_raw[2]),
+        .D (R_raw[3]),
+        .P (hng_p),
+        .Q (hng_q),
+        .R (hng_r),
+        .S (hng_s)
+    );
+ 
+ 
+    gpk_gate GPK (
+        .L  (hng_p),
+        .M  (hng_q),
+        .N  (hng_r),
+        .O  (hng_s),
+        .O1 (K[3]),
+        .O2 (K[2]),
+        .O3 (K[1]),
+        .O4 (K[0])
+    );
+endmodule
+ 
+ 
+module top_tks_hng_gpk_structure (
+    input  logic        clk,
+    input  logic        rst,
+    input  logic        en,
+    input  logic        excite,
+ 
+    input  logic [27:0] response_28_in,
+ 
+    output logic [3:0]  round_key,
+    output logic [31:0] response_32,
+ 
+    output logic [31:0] lfsr_challenge_dbg,
+    output logic        response0_dbg,
+    output logic        response1_dbg,
+    output logic        response2_dbg,
+    output logic        response3_dbg
+);
+    logic [31:0] lfsr_challenge;
+ 
+    logic [31:0] challenge_apuf0;
+    logic [31:0] challenge_apuf1;
+    logic [31:0] challenge_apuf2;
+    logic [31:0] challenge_apuf3;
+ 
+    logic response0;
+    logic response1;
+    logic response2;
+    logic response3;
+ 
+    logic q0_raw;
+    logic q3_raw;
+    logic q0_reg;
+    logic q3_reg;
+ 
+    lfsr_32 LFSR (
+        .clk       (clk),
+        .rst       (rst),
+        .en        (en),
+        .challenge (lfsr_challenge)
+    );
+ 
+    q_feedback_reg Q0_REG (
+        .clk   (clk),
+        .rst   (rst),
+        .en    (en),
+        .q_in  (q0_raw),
+        .q_reg (q0_reg)
+    );
+ 
+    q_feedback_reg Q3_REG (
+        .clk   (clk),
+        .rst   (rst),
+        .en    (en),
+        .q_in  (q3_raw),
+        .q_reg (q3_reg)
+    );
+ 
+    always_comb begin
+        challenge_apuf0 = lfsr_challenge;
+        challenge_apuf1 = lfsr_challenge;
+        challenge_apuf2 = lfsr_challenge;
+        challenge_apuf3 = lfsr_challenge;
+ 
+        challenge_apuf0[15] = lfsr_challenge[15] ^ q0_reg;
+        challenge_apuf3[15] = lfsr_challenge[15] ^ q3_reg;
+    end
+ 
+    apuf_32_tks A0 (
+        .excite    (excite),
+        .challenge (challenge_apuf0),
+        .response  (response0),
+        .tks_q     (q0_raw)
+    );
+ 
+    apuf_32_base A1 (
+        .excite    (excite),
+        .challenge (challenge_apuf1),
+        .response  (response1)
+    );
+ 
+    apuf_32_base A2 (
+        .excite    (excite),
+        .challenge (challenge_apuf2),
+        .response  (response2)
+    );
+ 
+    apuf_32_tks A3 (
+        .excite    (excite),
+        .challenge (challenge_apuf3),
+        .response  (response3),
+        .tks_q     (q3_raw)
+    );
+ 
+   
+    hng_gpk_aggregation AGG (
+        .R_raw ({response3, response2, response1, response0}),
+        .K     (round_key)
+    );
+ 
+    assign response_32 = {response_28_in, lfsr_challenge[31:28]};
+ 
+    assign lfsr_challenge_dbg = lfsr_challenge;
+    assign response0_dbg = response0;
+    assign response1_dbg = response1;
+    assign response2_dbg = response2;
+    assign response3_dbg = response3;
+endmodule
