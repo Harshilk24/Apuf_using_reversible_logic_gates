@@ -1,0 +1,215 @@
+`timescale 1ns / 1ps
+
+
+module crp_logger #(
+    parameter int CLKS_PER_BIT  = 868,  
+    parameter int SETTLE_CYCLES = 8,    
+                                          
+    parameter int WAIT_CYCLES   = 40     
+                                         
+)(
+    input  logic clk,
+    input  logic rst,
+    input  logic uart_rx_pin,
+    output logic uart_tx_pin,
+    output logic [7:0] last_byte_dbg
+);
+    localparam int NUM_ROUNDS = 8;       
+    localparam int FRAME_LEN  = 98;     
+ 
+    // ---------- UART ----------
+    logic [7:0] rx_data;
+    logic       rx_valid;
+    logic       tx_start = 1'b0;
+    logic [7:0] tx_byte  = 8'd0;
+    logic       tx_busy;
+    uart_rx #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_rx (.clk(clk), .rx(uart_rx_pin), .data(rx_data), .valid(rx_valid));
+    uart_tx #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_tx (.clk(clk), .start(tx_start), .data(tx_byte), .tx(uart_tx_pin), .busy(tx_busy));
+ 
+    // ---------- commands ----------
+    logic run = 1'b0;
+    always_ff @(posedge clk or posedge rst)
+        if (rst) run <= 1'b0;
+        else if (rx_valid) begin
+            if      (rx_data == 8'h47) run <= 1'b1;   // 'G'
+            else if (rx_data == 8'h53) run <= 1'b0;   // 'S'
+        end
+ 
+    // ---------- the PUF core ----------
+    logic        core_en;
+    logic        core_excite;
+    logic [27:0] response_28_in;
+    logic [3:0]  round_key;
+    logic [31:0] response_32_core;   
+                                    
+    logic [31:0] lfsr_challenge_dbg;
+    logic        r0_dbg, r1_dbg, r2_dbg, r3_dbg;
+ 
+    top_tks_hng_gpk_structure CORE (
+        .clk (clk), .rst (rst), .en (core_en), .excite (core_excite),
+        .response_28_in (response_28_in),
+        .round_key (round_key), .response_32 (response_32_core),
+        .lfsr_challenge_dbg (lfsr_challenge_dbg),
+        .response0_dbg (r0_dbg), .response1_dbg (r1_dbg),
+        .response2_dbg (r2_dbg), .response3_dbg (r3_dbg)
+    );
+ 
+    // HNG P/Q/R/S outputs for the CSV's debug field, recomputed here (pure combinational,
+    // identical gate to the one inside hng_gpk_aggregation) so they don't need to be
+    // exposed from inside AGG. These four bits are exactly what feeds GPK's L,M,N,O.
+    logic hng_p_dbg, hng_q_dbg, hng_r_dbg, hng_s_dbg;
+    hng_gate DBG_HNG (
+        .A(r0_dbg), .B(r1_dbg), .C(r2_dbg), .D(r3_dbg),
+        .P(hng_p_dbg), .Q(hng_q_dbg), .R(hng_r_dbg), .S(hng_s_dbg)
+    );
+ 
+    logic [3:0] raw_nibble_dbg;
+    assign raw_nibble_dbg = {r3_dbg, r2_dbg, r1_dbg, r0_dbg};
+    logic [3:0] hng_nibble_dbg;
+    assign hng_nibble_dbg = {hng_p_dbg, hng_q_dbg, hng_r_dbg, hng_s_dbg};
+ 
+    // Accumulated round_key history, 4 bits per round, MSB-first. 32 bits wide so all 8
+    // rounds fit; after round 7 it IS the logged response_32.
+    // The core still only sees the low 28 bits, which are identical to the old 28-bit
+    // key_accum for rounds 0..6, and hold keys r0..r6 during round 7 (the 8th round).
+    logic [31:0] key_accum;
+    assign response_28_in = key_accum[27:0];
+ 
+    // ---------- 98-byte frame buffer ----------
+    logic [7:0] frame [0:FRAME_LEN-1];
+    logic [6:0] byte_idx;     // 0..97
+    logic [2:0] round_idx;    // 0..7
+    logic [15:0] crc;
+    logic [15:0] packet_sequence = 16'd0;
+ 
+    // combinational offset of this round's 11-byte record (4 + 11*round_idx)
+    logic [6:0] record_off;
+    always_comb begin
+        case (round_idx)
+            3'd0: record_off = 7'd4;   3'd1: record_off = 7'd15;
+            3'd2: record_off = 7'd26;  3'd3: record_off = 7'd37;
+            3'd4: record_off = 7'd48;  3'd5: record_off = 7'd59;
+            3'd6: record_off = 7'd70;
+            default: record_off = 7'd81;   // round 7
+        endcase
+    end
+ 
+    function automatic [15:0] crc16_update(input [15:0] crc_in, input [7:0] b);
+        reg [15:0] c;
+        integer i;
+        begin
+            c = crc_in ^ (16'(b) << 8);
+            for (i = 0; i < 8; i = i + 1)
+                c = c[15] ? ((c << 1) ^ 16'h1021) : (c << 1);
+            crc16_update = c;
+        end
+    endfunction
+ 
+    // ---------- FSM ----------
+    localparam logic [3:0]
+        S_IDLE      = 4'd0,
+        S_STEP      = 4'd1,   // pulse en: advance LFSR + both Q-regs together
+        S_SETTLE    = 4'd2,   // let the new challenge/TKS wiring settle (excite low: also the
+                               // release/fall-back period for the race paths from last round)
+        S_EXCITE    = 4'd3,   // race + capture, held the full WAIT_CYCLES
+        S_CAPTURE   = 4'd4,   // latch this round's fields into the frame buffer
+        S_FINALIZE  = 4'd5,   // after round 7: key_accum holds all 8 keys -> response_32 bytes
+        S_CRC       = 4'd6,   // compute CRC over bytes 0..95, one byte per cycle
+        S_SEND      = 4'd7,   // shift all 98 bytes out over UART
+        S_SEND_GAP  = 4'd8,   // one cycle so uart_tx's 'busy' has risen before we poll it
+        S_SEND_WAIT = 4'd9;
+    logic [3:0] state = S_IDLE;
+    logic [7:0] wait_cnt = 8'd0;
+    logic [6:0] crc_idx  = 7'd0;
+ 
+    assign core_en     = (state == S_STEP);
+    assign core_excite = (state == S_EXCITE);
+    assign last_byte_dbg = frame[FRAME_LEN-1];
+ 
+    always_ff @(posedge clk or posedge rst) begin
+        if (rst) begin
+            state <= S_IDLE;
+            byte_idx <= 7'd0; round_idx <= 3'd0; wait_cnt <= 8'd0; crc_idx <= 7'd0;
+            key_accum <= 32'd0; tx_start <= 1'b0; packet_sequence <= 16'd0;
+        end else begin
+            tx_start <= 1'b0;
+            case (state)
+            S_IDLE: begin
+                if (run) begin
+                    frame[0] <= 8'hA5; frame[1] <= 8'h5A;
+                    frame[2] <= packet_sequence[15:8]; frame[3] <= packet_sequence[7:0];
+                    round_idx <= 3'd0; key_accum <= 32'd0; wait_cnt <= 8'd0;
+                    state <= S_STEP;
+                end
+            end
+            S_STEP: state <= S_SETTLE;   // core_en was asserted combinationally this cycle
+            S_SETTLE: begin
+                if (wait_cnt == SETTLE_CYCLES[7:0] - 8'd1) begin wait_cnt <= 8'd0; state <= S_EXCITE; end
+                else wait_cnt <= wait_cnt + 8'd1;
+            end
+            S_EXCITE: begin
+                if (wait_cnt == WAIT_CYCLES[7:0] - 8'd1) begin wait_cnt <= 8'd0; state <= S_CAPTURE; end
+                else wait_cnt <= wait_cnt + 8'd1;
+            end
+            S_CAPTURE: begin
+                frame[record_off+0]  <= lfsr_challenge_dbg[31:24];
+                frame[record_off+1]  <= lfsr_challenge_dbg[23:16];
+                frame[record_off+2]  <= lfsr_challenge_dbg[15:8];
+                frame[record_off+3]  <= lfsr_challenge_dbg[7:0];
+                frame[record_off+4]  <= lfsr_challenge_dbg[31:24];   // challenge == lfsr_challenge
+                frame[record_off+5]  <= lfsr_challenge_dbg[23:16];
+                frame[record_off+6]  <= lfsr_challenge_dbg[15:8];
+                frame[record_off+7]  <= lfsr_challenge_dbg[7:0];
+                frame[record_off+8]  <= {4'b0000, raw_nibble_dbg};
+                frame[record_off+9]  <= {4'b0000, hng_nibble_dbg};
+                frame[record_off+10] <= {4'b0000, round_key};
+ 
+                key_accum <= {key_accum[27:0], round_key};
+ 
+                if (round_idx == 3'd7) begin
+                    state <= S_FINALIZE;
+                end else begin
+                    round_idx <= round_idx + 3'd1;
+                    state <= S_STEP;
+                end
+            end
+            S_FINALIZE: begin   // key_accum now holds r0..r7: response_32 = 8 gpk_key nibbles
+                frame[92] <= key_accum[31:24];
+                frame[93] <= key_accum[23:16];
+                frame[94] <= key_accum[15:8];
+                frame[95] <= key_accum[7:0];
+                crc <= 16'hFFFF; crc_idx <= 7'd0;
+                state <= S_CRC;
+            end
+            S_CRC: begin
+                crc <= crc16_update(crc, frame[crc_idx]);
+                if (crc_idx == 7'd95) begin
+                    byte_idx <= 7'd0;
+                    state <= S_SEND;
+                end else crc_idx <= crc_idx + 7'd1;
+            end
+            S_SEND: begin
+                if (byte_idx == 7'd96) frame[96] <= crc[15:8];
+                if (byte_idx == 7'd97) frame[97] <= crc[7:0];
+                if (!tx_busy) begin
+                    tx_byte  <= (byte_idx == 7'd96) ? crc[15:8] :
+                                (byte_idx == 7'd97) ? crc[7:0]  : frame[byte_idx];
+                    tx_start <= 1'b1;
+                    state <= S_SEND_GAP;
+                end
+            end
+            S_SEND_GAP: state <= S_SEND_WAIT;
+            S_SEND_WAIT: if (!tx_busy) begin
+                if (byte_idx == 7'd97) begin
+                    packet_sequence <= packet_sequence + 16'd1;
+                    state <= S_IDLE;
+                end else begin
+                    byte_idx <= byte_idx + 7'd1;
+                    state <= S_SEND;
+                end
+            end
+            default: state <= S_IDLE;
+            endcase
+        end
+    end 
+endmodule
